@@ -1,0 +1,209 @@
+#!/bin/bash
+
+# Clipboard Monitor - macOS Compatible (Bash 3.2+)
+# Detects source app and URL, saves images, logs everything
+
+OUTPUT_FILE="${1:-clipboard_capture.txt}"
+INTERVAL="${2:-2}"
+
+LAST_TEXT_HASH=""
+LAST_IMAGE_HASH=""
+CAPTURE_COUNT=0
+
+OUTPUT_DIR="$(cd "$(dirname "$OUTPUT_FILE")" && pwd)"
+IMAGES_DIR="$OUTPUT_DIR/clipboard_images"
+mkdir -p "$IMAGES_DIR"
+
+TMP_DIR="/tmp/clipboard_monitor_$$"
+mkdir -p "$TMP_DIR"
+
+cleanup() {
+    rm -rf "$TMP_DIR"
+    echo ""
+    echo "Monitor stopped."
+    exit 0
+}
+trap cleanup INT TERM
+
+# Get frontmost application name via JXA
+get_source_app() {
+    osascript -l JavaScript -e 'ObjC.import("AppKit"); var ws = $.NSWorkspace.sharedWorkspace; var app = ws.frontmostApplication; app.localizedName.js || "Unknown";' 2>/dev/null || echo "Unknown"
+}
+
+# Get URL from pasteboard if available
+get_source_url() {
+    local js
+    js='ObjC.import("Cocoa"); var pb = $.NSPasteboard.generalPasteboard; var data = pb.stringForType("public.url"); data ? data.js : "";'
+    osascript -l JavaScript -e "$js" 2>/dev/null
+}
+
+# Extract image via JXA using UTI strings
+extract_image_jxa() {
+    local out_file="$1"
+    local uti="$2"
+
+    local js
+    js=$(printf 'ObjC.import("Cocoa"); var pb = $.NSPasteboard.generalPasteboard; var data = pb.dataForType("%s"); if (data && data.length > 0) { data.writeToFileAtomically("%s", true); "OK:" + data.length; } else { "FAIL"; }' "$uti" "$out_file")
+
+    osascript -l JavaScript -e "$js" 2>/dev/null
+}
+
+# Validate image file by magic bytes and minimum size
+validate_image() {
+    local file="$1"
+    local format="$2"
+
+    local size
+    size=$(stat -f%z "$file" 2>/dev/null || echo 0)
+    [ "$size" -lt 100 ] && return 1
+
+    local magic
+    magic=$(od -An -tx1 -N4 "$file" 2>/dev/null | tr -d ' \n')
+
+    case "$format" in
+        png)
+            [ "$magic" = "89504e47" ] && return 0
+            ;;
+        tiff)
+            [ "$magic" = "49492a00" ] || [ "$magic" = "4d4d002a" ] && return 0
+            ;;
+    esac
+    return 1
+}
+
+echo "Clipboard Monitor"
+echo "Log:    $OUTPUT_FILE"
+echo "Images: $IMAGES_DIR/"
+echo "Interval: ${INTERVAL}s"
+echo ""
+
+while true; do
+    TIMESTAMP=$(date '+%d %b %Y %H:%M:%S')
+    CAPTURED=false
+
+    # Detect source app and URL at capture time
+    SOURCE_APP=$(get_source_app)
+    SOURCE_URL=$(get_source_url)
+
+    # ═══════════════════════════════════════════════════════════════
+    # 1. IMAGE CAPTURE
+    # ═══════════════════════════════════════════════════════════════
+    for FORMAT in png tiff; do
+        TMP_IMG="$TMP_DIR/clipboard.$FORMAT"
+        rm -f "$TMP_IMG"
+
+        UTI="public.$FORMAT"
+        RESULT=$(extract_image_jxa "$TMP_IMG" "$UTI")
+
+        # Fallback to pbpaste if JXA failed or produced invalid data
+        if ! echo "$RESULT" | grep -q "^OK:" || ! validate_image "$TMP_IMG" "$FORMAT"; then
+            rm -f "$TMP_IMG"
+            pbpaste -Prefer "$FORMAT" > "$TMP_IMG" 2>/dev/null
+        fi
+
+        if validate_image "$TMP_IMG" "$FORMAT"; then
+            IMG_SIZE=$(stat -f%z "$TMP_IMG")
+            CURRENT_HASH=$(md5 -q "$TMP_IMG")
+
+            if [ "$CURRENT_HASH" != "$LAST_IMAGE_HASH" ]; then
+                LAST_IMAGE_HASH="$CURRENT_HASH"
+                CAPTURE_COUNT=$((CAPTURE_COUNT + 1))
+
+                SAFE_TS=$(date '+%Y-%m-%d_%H-%M-%S')
+                IMAGE_FILE="$IMAGES_DIR/clipboard_${SAFE_TS}_${CAPTURE_COUNT}.$FORMAT"
+                cp "$TMP_IMG" "$IMAGE_FILE"
+
+                {
+                    echo ""
+                    echo "=== $TIMESTAMP | Capture #$CAPTURE_COUNT ==="
+                    echo "Type:   IMAGE ($FORMAT)"
+                    echo "Size:   $IMG_SIZE bytes"
+                    echo "MD5:    $CURRENT_HASH"
+                    echo "File:   $IMAGE_FILE"
+                    echo "Source: $SOURCE_APP"
+                    [ -n "$SOURCE_URL" ] && echo "URL:    $SOURCE_URL"
+                    echo "=================================="
+                } >> "$OUTPUT_FILE"
+
+                echo ""
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "✅ IMAGE CAPTURED!"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "   Capture #:  $CAPTURE_COUNT"
+                echo "   Timestamp:  $TIMESTAMP"
+                echo "   Type:       IMAGE ($FORMAT)"
+                echo "   Size:       $IMG_SIZE bytes"
+                echo "   MD5:        $CURRENT_HASH"
+                echo "   Source:     $SOURCE_APP"
+                [ -n "$SOURCE_URL" ] && echo "   URL:        $SOURCE_URL"
+                echo "   File:       $IMAGE_FILE"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            fi
+
+            CAPTURED=true
+            break
+        fi
+    done
+
+    # ═══════════════════════════════════════════════════════════════
+    # 2. TEXT CAPTURE (only if no valid image found)
+    # ═══════════════════════════════════════════════════════════════
+    if [ "$CAPTURED" = false ]; then
+        CURRENT=$(pbpaste 2>/dev/null)
+        [ -z "$CURRENT" ] && { sleep "$INTERVAL"; continue; }
+
+        CURRENT_LEN=${#CURRENT}
+        [ "$CURRENT_LEN" -lt 2 ] && { sleep "$INTERVAL"; continue; }
+
+        # Skip file paths and URLs that apps put on clipboard alongside images
+        case "$CURRENT" in
+            /Users/*|/Volumes/*|file://*|/private/*|/var/folders/*|http*|https*|www.*)
+                sleep "$INTERVAL"
+                continue
+                ;;
+        esac
+
+        # Skip if contains null bytes (binary / corrupted data)
+        if printf '%s' "$CURRENT" | od -An -tx1 | grep -q "00"; then
+            sleep "$INTERVAL"
+            continue
+        fi
+
+        CURRENT_HASH=$(printf '%s' "$CURRENT" | md5 -q)
+
+        if [ "$CURRENT_HASH" != "$LAST_TEXT_HASH" ]; then
+            LAST_TEXT_HASH="$CURRENT_HASH"
+            CAPTURE_COUNT=$((CAPTURE_COUNT + 1))
+
+            {
+                echo ""
+                echo "=== $TIMESTAMP | Capture #$CAPTURE_COUNT ==="
+                echo "Type: TEXT"
+                echo "Size: $CURRENT_LEN bytes"
+                echo "MD5:  $CURRENT_HASH"
+                echo "Source: $SOURCE_APP"
+                [ -n "$SOURCE_URL" ] && echo "URL:    $SOURCE_URL"
+                echo "=================================="
+                echo "$CURRENT"
+                echo "=================================="
+            } >> "$OUTPUT_FILE"
+
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "✅ TEXT CAPTURED!"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "   Capture #:  $CAPTURE_COUNT"
+            echo "   Timestamp:  $TIMESTAMP"
+            echo "   Type:       TEXT"
+            echo "   Size:       $CURRENT_LEN bytes"
+            echo "   MD5:        $CURRENT_HASH"
+            echo "   Source:     $SOURCE_APP"
+            [ -n "$SOURCE_URL" ] && echo "   URL:        $SOURCE_URL"
+            echo "───────────────────────────────────────────────────────────────"
+            echo "$CURRENT"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        fi
+    fi
+
+    sleep "$INTERVAL"
+done
